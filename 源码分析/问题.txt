@@ -1,0 +1,122 @@
+Flink 向 Kafka 写入时开启事务
+
+  核心是 两阶段提交（2PC），Flink 通过 Kafka 的事务 API 来保证 Exactly-Once。
+
+  配置方式
+
+  新版 KafkaSink API（推荐）
+
+  KafkaSink<String> sink = KafkaSink.<String>builder()
+      .setBootstrapServers("broker:9092")
+      .setRecordSerializer(...)
+      // 关键：设置为 EXACTLY_ONCE
+      .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+      // 必须设置事务前缀（Kafka 用它来区分不同的事务生产者）
+      .setTransactionalIdPrefix("my-flink-job")
+      .build();
+
+  旧版 FlinkKafkaProducer API（已废弃）
+
+  FlinkKafkaProducer<String> producer = new FlinkKafkaProducer<>(
+      "topic",
+      schema,
+      properties,
+      FlinkKafkaProducer.Semantic.EXACTLY_ONCE  // ← 关键
+  );
+
+  必须同时满足的条件
+
+  Flink 侧：
+    ✓ Checkpoint 开启
+    ✓ DeliveryGuarantee.EXACTLY_ONCE
+    ✓ 设置 transactionalIdPrefix
+
+  Kafka 侧：
+    ✓ transaction.max.timeout.ms ≥ Flink 的 checkpoint interval + 最大容忍时间
+    ✓ 消费者设置 isolation.level = read_committed（否则能读到未提交数据）
+
+  两阶段提交流程
+
+  时间线 ─────────────────────────────────────────────►
+
+  Checkpoint N 周期：
+
+    ① 开启 Kafka 事务
+    │
+    ② 不断写数据到 Kafka（预写入，消费者看不到）
+    │   producer.send(record)  ← 数据已写入 Kafka 分区
+    │   producer.send(record)     但对 read_committed 消费者不可见
+    │   producer.send(record)
+    │
+    ③ Checkpoint Barrier 到达 → snapshotState()
+    │   预提交（preCommit）：flush 所有缓冲数据到 Kafka
+    │   保存事务 ID 到 Checkpoint 状态
+    │
+    ④ Checkpoint 完成通知 → notifyCheckpointComplete()
+    │   正式提交事务：producer.commitTransaction()
+    │   此时消费者才能看到这批数据
+    │
+    ⑤ 开启下一个 Kafka 事务（下一个 Checkpoint 周期）
+
+  故障恢复时
+
+  场景：Checkpoint N 完成，正在写 Checkpoint N+1 的数据时挂了
+
+  恢复后：
+    1. 从 Checkpoint N 的状态中读出保存的事务 ID
+    2. N+1 期间预写入但未提交的数据 → Kafka 自动 abort（超时回滚）
+    3. 从 Checkpoint N 的 offset 重新消费，重新写入
+    → 不丢不重
+
+  关键配置参数
+
+  # Flink 侧
+  execution.checkpointing.interval: 60000       # Checkpoint 间隔
+  execution.checkpointing.mode: EXACTLY_ONCE
+
+  # Kafka 侧（Broker 配置）
+  transaction.max.timeout.ms: 900000             # 默认 15 分钟，要大于 Checkpoint
+  间隔
+
+  # Kafka 消费端（下游读取这些数据时）
+  isolation.level: read_committed                # 只读已提交事务的数据
+
+  transaction.max.timeout.ms 这个容易踩坑：
+
+  如果 Flink Checkpoint 间隔 = 10 分钟
+  Kafka transaction.max.timeout.ms = 15 分钟（默认）
+
+  一旦 Checkpoint 耗时稍长，事务就可能超时被 Kafka 自动 abort
+  → 数据丢失
+
+  建议：transaction.max.timeout.ms 至少是 Checkpoint 间隔的 2-3 倍
+
+  三种语义对比
+
+  ┌───────────────┬────────────┬──────┬────────────────────────┐
+  │     语义      │ 是否开事务 │ 性能 │        数据保证        │
+  ├───────────────┼────────────┼──────┼────────────────────────┤
+  │ NONE          │ 不开       │ 最高 │ At-Most-Once（可能丢） │
+  ├───────────────┼────────────┼──────┼────────────────────────┤
+  │ AT_LEAST_ONCE │ 不开       │ 高   │ 不丢但可能重           │
+  ├───────────────┼────────────┼──────┼────────────────────────┤
+  │ EXACTLY_ONCE  │ 开         │ 较低 │ 不丢不重               │
+  └───────────────┴────────────┴──────┴────────────────────────┘
+
+  性能下降的原因：
+
+  EXACTLY_ONCE 慢在哪：
+    1. 每个 Checkpoint 周期开启/提交一次 Kafka 事务 → 额外开销
+    2. 数据要等事务提交后才对消费者可见 → 增加端到端延迟
+    3. 预提交时要 flush 所有数据 → 可能有短暂的写入停顿
+
+  ★ Insight ─────────────────────────────────────
+  - transactionalIdPrefix 的设计非常关键——Flink 会给每个 SubTask 生成唯一的
+  transactional.id（格式类似 my-flink-job-{subtaskIndex}）。恢复后新的 Producer
+  用同样的 transactional.id 连接 Kafka，Kafka 会自动把上一个同 ID 的 Producer
+  未完成的事务 abort 掉（叫做 zombie fencing），这就避免了脑裂问题
+  - Exactly-Once 写 Kafka 的端到端延迟 = Checkpoint
+  间隔。因为数据在事务提交前对消费者不可见，而事务提交发生在 Checkpoint 完成时。如果
+   Checkpoint 间隔是 1 分钟，下游消费者最多延迟 1 分钟才能看到数据。这是
+  Exactly-Once 的固有代价
+  ─────────────────────────────────────────────────
